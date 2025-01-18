@@ -18,17 +18,29 @@
 #include "thinfont/thinfont.h"
 
 #define CHECK_TIMER(t) if( t ) t--; else 
+
+#define DELAY_RELE_ON    5    // ritardo di accensione rele [s]
+#define DELAY_RELE_OFF   5    // ritardo di spegnimento rele [s]
+#define DELAY_FALLBACK   3600*3
+#define SHORT_PRESS      2
+#define LONG_PRESS      20
+
 int millis_prev = 0;
 int timer_backlight = 5;
 int timer_update = 0;
 int timer_debounce = 0;
 int timer_read = 0;
+int timer_fallback = 0;
 int temp_now = 180;
-int temp_set = 180;
+int input_temp = 180;
+int target_temp = 180;
+int default_temp = 180;
 int button_up = 0;
 int button_down = 0;
-int histeresys_on = 5;
-int histeresys_off = 5;
+int delay_rele_on = DELAY_RELE_ON;
+int delay_rele_off = DELAY_RELE_OFF;
+int system_on = 0;
+int target_locked = 0;
 
 #define ntcValueCount 10
 const int16_t  ntcTemp[]  = {   0,  50, 100, 150, 200, 250, 300, 400, 500, 600 };
@@ -42,6 +54,50 @@ void initTemp() {
   int i;
   for(i=0; i<TEMPSAMPLES; i++) temp_array[i] = temp_now;
   temp_index = 0;
+}
+
+void incTargetTemp() {
+  if( target_temp==input_temp && input_temp<600 ) input_temp += 5;
+  target_temp = input_temp;
+  timer_fallback = DELAY_FALLBACK;
+}
+
+void decTargetTemp() {
+  if( target_temp==input_temp && target_temp>0 ) input_temp -= 5;
+  target_temp = input_temp;
+  timer_fallback = DELAY_FALLBACK;
+}
+
+void resetTargetTemp() {
+  target_temp = default_temp;
+}
+
+int getTargetTemp() {
+  return target_temp;
+}
+
+int getDefaultTemp() {
+  return default_temp;
+}
+
+void lock() {
+  target_locked = 1;
+  timer_fallback = DELAY_FALLBACK;
+}
+
+void unlock() {
+  target_locked = 0;
+  timer_fallback = DELAY_FALLBACK;
+}
+
+void on() {
+  system_on = 1;
+  timer_fallback = DELAY_FALLBACK;
+}
+
+void off() {
+  system_on = 0;
+  timer_fallback = DELAY_FALLBACK;
 }
 
 void readTemp() {
@@ -64,17 +120,23 @@ void readTemp() {
       break;
     }
   }
-  return value;
+  return;
 }
 
 void displayRefresh() {
+  int temp_set = getTargetTemp();
   display.clearDisplay();
   display.setTextColor(WHITE);
   display.setTextSize(1);
 
-  if(temp_set>=100) display.drawBitmap(10-2,0,THINFONT24(temp_set/100),WHITE);
-  display.drawBitmap(20-2,0,THINFONT24((temp_set%100)/10),WHITE);
-  display.drawBitmap(30-2,11,THINFONT12(temp_set%10),WHITE);
+  if( system_on ) {
+    if(temp_set>=100) display.drawBitmap(8,0,THINFONT24(temp_set/100),WHITE);
+    display.drawBitmap(18,0,THINFONT24((temp_set%100)/10),WHITE);
+    display.drawBitmap(28,11,THINFONT12(temp_set%10),WHITE);
+    if( target_locked ) {
+      display.fillRect(0,26,40,2,INVERSE);
+    }
+  }
 
   if(temp_now>=100) display.drawBitmap(55,0,THINFONT48(temp_now/100),WHITE);
   display.drawBitmap(75,0,THINFONT48((temp_now%100)/10),WHITE);
@@ -86,12 +148,28 @@ void displayRefresh() {
 void checkButtons() {
     if( digitalRead(BUTTON_UP)==LOW ) {
       button_up++;
+      if( button_up==LONG_PRESS && !button_down ) {
+        lock();
+      }
     } else {
+      if( button_up>=SHORT_PRESS && button_up<LONG_PRESS && button_down==0 ) {
+        if( !system_on ) on();
+        else if( target_locked ) unlock();
+        else incTargetTemp();
+      }
       button_up = 0;
     }
     if( digitalRead(BUTTON_DOWN)==LOW ) {
       button_down++;
+      if( button_down==LONG_PRESS && !button_up ) {
+        off();
+      }
     } else {
+      if( button_down>=SHORT_PRESS && button_down<LONG_PRESS && button_up==0 ) {
+        if( !system_on ) on();
+        else if( target_locked ) unlock();
+        else decTargetTemp();
+      }
       button_down = 0;
     }
 
@@ -106,12 +184,6 @@ void checkButtons() {
       }
       timer_backlight = 15;
       displayRefresh();
-    }
-    if( button_up==2 && !button_down ) {
-      if( temp_set<600 ) temp_set += 5;
-    }
-    if( button_down==2 && !button_up ) {
-      if( temp_set>0 ) temp_set -= 5;
     }
 }
 
@@ -139,6 +211,7 @@ void loop() {
     millis_prev = millis_now;
     
     CHECK_TIMER( timer_update ) {
+      int temp_set = getTargetTemp();
       timer_update = 1000;
       if( timer_backlight ) {
         timer_backlight--;
@@ -151,25 +224,37 @@ void loop() {
           display.ssd1306_command(0);
         }
       }
+      if( !target_locked && timer_fallback ) {
+        timer_fallback--;
+        if( timer_fallback==0 && getTargetTemp()>getDefaultTemp() ) {
+          resetTargetTemp();
+        }
+      }
       readTemp();
       displayRefresh();
-      if( temp_now>temp_set+3 ) {
-        if( histeresys_off ) {
-          histeresys_off--;
+      if( system_on ) {
+        if( temp_now>temp_set+3 ) {
+          if( delay_rele_off ) {
+            delay_rele_off--;
+          } else {
+            digitalWrite(releOutput, LOW);
+          }
         } else {
-          digitalWrite(releOutput, LOW);
+          delay_rele_off = DELAY_RELE_OFF;
+        }
+        if( temp_now<temp_set-3 ) {
+          if( delay_rele_on ) {
+            delay_rele_on--;
+          } else {
+            digitalWrite(releOutput, HIGH);
+          }
+        } else {
+          delay_rele_on = DELAY_RELE_ON;
         }
       } else {
-        histeresys_off = 5;
-      }
-      if( temp_now<temp_set-3 ) {
-        if( histeresys_on ) {
-          histeresys_on--;
-        } else {
-          digitalWrite(releOutput, HIGH);
-        }
-      } else {
-        histeresys_on = 5;
+        delay_rele_on = DELAY_RELE_ON;
+        timer_fallback = DELAY_FALLBACK;
+        digitalWrite(releOutput, LOW);
       }
     }
 
